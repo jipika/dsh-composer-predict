@@ -19,8 +19,16 @@
  *      `<log seq>|<provider>/<model>`: re-entering a finished turn, or a
  *      duplicate turn/end, costs zero model calls.
  *   4. Skip before spend. Empty drafts are decided in the browser half; here we
- *      skip non-completed turns, sessions that never routed a request, and
- *      concurrent turns beyond the concurrency budget.
+ *      skip non-completed turns, sessions that never routed a request, turns
+ *      whose prediction is already cached, and turns whose NEXT request would
+ *      occupy more than `maxPressureRatio` of the routed context window. That
+ *      last guard reads the token-meter `contextPressure` projection — an O(1)
+ *      fold — and silently stands down when the projection, the route capacity,
+ *      or the projection service itself is absent.
+ *   5. Newest wins. At most one auxiliary call runs: when a newer turn finishes
+ *      while a guess is still streaming, the older call is aborted and counted
+ *      as superseded, not as a failure. The suggestion that lands therefore
+ *      always belongs to the turn that just ended.
  *
  * This file loads through the bundle patch channel (`cordis.patch.yml`), so a
  * change here needs a host restart; the browser half reloads over HMR.
@@ -44,6 +52,14 @@ const DEFAULT_MAX_TOKENS = 200
 /** The auxiliary call must never outlive the turn that produced it by much. */
 const DEFAULT_TIMEOUT_MS = 25_000
 
+/**
+ * Stand down once the next request would occupy this share of the context
+ * window. A prediction replays the whole conversation, so on a nearly full
+ * context it is the most expensive and least useful call the plugin can make.
+ * `0` disables the guard.
+ */
+const DEFAULT_MAX_PRESSURE_RATIO = 0.7
+
 /** Sessions kept in the result cache (LRU, insertion-ordered Map). */
 const CACHE_LIMIT = 64
 
@@ -53,7 +69,11 @@ const CACHE_LIMIT = 64
  */
 const TURNS_PER_SESSION = 20
 
-/** Concurrent predictions allowed across all sessions. */
+/**
+ * Predictions allowed to run at once across all sessions. The one slot is
+ * deliberately exclusive: the plugin exists to guess the NEXT message, so a
+ * guess for an older turn is worth less than one for the turn that just ended.
+ */
 const CONCURRENCY = 1
 
 /**
@@ -87,8 +107,16 @@ const EMPTY = {}
  */
 const cache = new Map()
 
-/** Predictions currently in flight. */
+/** Predictions currently in flight; mirrors whether {@link running} is set. */
 let inflight = 0
+
+/**
+ * The one prediction allowed to stream right now, or null. Kept by reference
+ * identity: a superseding turn replaces it, so the older call's `finally` sees
+ * `running !== slot` and leaves the slot and the timer alone.
+ * @type {{ controller: AbortController, superseded: boolean, timedOut: boolean, sessionId: string, turn: number } | null}
+ */
+let running = null
 
 /**
  * Mount-time counters for {@link DIAG_PATH}. They hold no conversation text:
@@ -101,9 +129,13 @@ const stats = {
   turnEnds: 0,
   skipped: 0,
   starts: 0,
+  superseded: 0,
+  pressureSkips: 0,
   failures: 0,
   lastFailure: '',
   lastKey: '',
+  /** Last measured occupancy as a share of the route's context window, or 0. */
+  lastPressure: 0,
 }
 
 /**
@@ -151,6 +183,40 @@ function cacheKey(session) {
 }
 
 /**
+ * Occupancy the NEXT request would reach, as a share of the routed capacity.
+ *
+ * Read from the token-meter `contextPressure` projection rather than estimated
+ * here: that unit already folds the provider's newest prompt sample plus the
+ * signed surface movement since it, so the number is anchored to what the
+ * provider actually charged and stays correct across a compaction. Every
+ * unavailable input means "no opinion" (`undefined`) — never a false stop:
+ * the projection service, the usage sample, and the route capacity each have
+ * to be present.
+ *
+ * @param {object} ctx - host plugin context.
+ * @param {object} session - finished session.
+ * @returns {number|undefined} share of the window in use, or undefined.
+ */
+function pressureRatio(ctx, session) {
+  const registry = typeof ctx.get === 'function' ? ctx.get('sessionProjections') : undefined
+  if (registry === undefined || typeof registry.snapshot !== 'function') return undefined
+  let view
+  try {
+    // O(1): the unit is folded incrementally on every committed event.
+    view = registry.snapshot(session, ['contextPressure']).values.contextPressure
+  } catch {
+    // A missing unit, a schema mismatch, or a half-restored cell all mean the
+    // same thing to a guess: no occupancy signal this turn.
+    return undefined
+  }
+  if (view === undefined) return undefined
+  const tokens = view.projectedTokens ?? view.pressureTokens
+  const capacity = view.contextWindow
+  if (typeof tokens !== 'number' || typeof capacity !== 'number' || capacity <= 0) return undefined
+  return tokens / capacity
+}
+
+/**
  * Reduce model output to one clean draft: strip code fences, wrapping quotes, role
  * prefixes, and newlines; honor the SKIP sentinel.
  * @param {string} raw - accumulated text-delta output.
@@ -181,10 +247,10 @@ function clean(raw) {
  * @param {object} session - finished session.
  * @param {number} turn - completed turn the prediction belongs to.
  * @param {number} maxTokens - completion cap.
- * @param {number} timeoutMs - hard wall-clock cap for the auxiliary call.
+ * @param {AbortSignal} signal - caller-owned cancellation: supersession or timeout.
  * @returns {Promise<void>} resolves when the prediction is stored or skipped.
  */
-async function predict(ctx, session, turn, maxTokens, timeoutMs) {
+async function predict(ctx, session, turn, maxTokens, signal) {
   const header = session.requestHeader()
   const config = header?.config
   if (config === undefined || config.provider === undefined || config.model === undefined) return
@@ -205,7 +271,7 @@ async function predict(ctx, session, turn, maxTokens, timeoutMs) {
     ...(header.tools === undefined ? {} : { tools: header.tools }),
     maxTokens,
     sessionId: session.id,
-    signal: AbortSignal.timeout(timeoutMs),
+    signal,
   }
 
   let text = ''
@@ -216,6 +282,8 @@ async function predict(ctx, session, turn, maxTokens, timeoutMs) {
   }
   if (failed) return
 
+  // An abort can land after the stream already settled; storing that text is
+  // still correct (the turn's own guess is complete), so no check is needed.
   remember(session.id, turn, {
     key: cacheKey(session),
     text: clean(text),
@@ -227,7 +295,8 @@ async function predict(ctx, session, turn, maxTokens, timeoutMs) {
 /**
  * Mount the plugin. A failure here must never take the host down with it, so the
  * real body lives in `mount` and any throw is logged and swallowed.
- * @param {object} ctx - Cordis host context carrying `llm` and `webServer`.
+ * @param {object} ctx - Cordis host context carrying `llm` and `webServer`, plus
+ *   an optionally-available `sessionProjections` read through `ctx.get`.
  * @param {object} [rawConfig] - patch config overrides.
  */
 export function apply(ctx, rawConfig) {
@@ -240,13 +309,18 @@ export function apply(ctx, rawConfig) {
 
 /**
  * Register the state route and the turn/end listener.
- * @param {object} ctx - Cordis host context carrying `llm` and `webServer`.
+ * @param {object} ctx - Cordis host context carrying `llm` and `webServer`, plus
+ *   an optionally-available `sessionProjections` read through `ctx.get`.
  * @param {object} [rawConfig] - patch config overrides.
  */
 function mount(ctx, rawConfig) {
   const config = rawConfig ?? {}
   const maxTokens = Number.isFinite(config.maxTokens) ? Number(config.maxTokens) : DEFAULT_MAX_TOKENS
   const timeoutMs = Number.isFinite(config.timeoutMs) ? Number(config.timeoutMs) : DEFAULT_TIMEOUT_MS
+  // `0` (or a negative) turns the occupancy guard off entirely.
+  const maxPressureRatio = Number.isFinite(config.maxPressureRatio)
+    ? Number(config.maxPressureRatio)
+    : DEFAULT_MAX_PRESSURE_RATIO
   stats.mountedAt = Date.now()
 
   ctx.effect(() => ctx.webServer.register({
@@ -313,10 +387,6 @@ function mount(ctx, rawConfig) {
       stats.skipped += 1
       return
     }
-    if (inflight >= CONCURRENCY) {
-      stats.skipped += 1
-      return
-    }
 
     const turn = event.data.turn
     const key = cacheKey(session)
@@ -326,17 +396,55 @@ function mount(ctx, rawConfig) {
       return
     }
 
+    // Occupancy guard: a nearly full context makes the replayed prefix the most
+    // expensive request the plugin can send, for the least reliable guess.
+    const ratio = pressureRatio(ctx, session)
+    if (ratio !== undefined) {
+      stats.lastPressure = Math.round(ratio * 1000) / 1000
+      if (maxPressureRatio > 0 && ratio >= maxPressureRatio) {
+        stats.pressureSkips += 1
+        return
+      }
+    }
+
+    // Newest wins: the exclusive slot is handed to this turn, and whatever was
+    // streamed for an older one is cancelled. The older call's `finally` sees a
+    // different slot, so it neither clears `running` nor touches `inflight`;
+    // its own timer is cleared there too, before this branch could be revisited.
+    if (running !== null) {
+      running.superseded = true
+      running.controller.abort()
+    }
+    const controller = new AbortController()
+    const slot = { controller, superseded: false, timedOut: false, sessionId: session.id, turn }
+    const timer = setTimeout(() => {
+      slot.timedOut = true
+      controller.abort()
+    }, timeoutMs)
+    running = slot
+
     stats.starts += 1
     stats.lastKey = key
-    inflight += 1
-    void predict(ctx, session, turn, maxTokens, timeoutMs)
+    inflight = CONCURRENCY
+    void predict(ctx, session, turn, maxTokens, controller.signal)
       .catch((error) => {
+        // Supersession is the slot working as designed, not a broken call.
+        if (slot.superseded) {
+          stats.superseded += 1
+          return
+        }
         stats.failures += 1
         // Class only: an error message can quote the transcript, and this value
-        // is served over HTTP.
-        stats.lastFailure = String(error?.name ?? typeof error)
-        console.error('[dsh-composer-predict] prediction failed:', error?.name ?? error)
+        // is served over HTTP. A timeout is reported as such, never as a name
+        // the transport happened to raise.
+        stats.lastFailure = slot.timedOut ? 'Timeout' : String(error?.name ?? typeof error)
+        console.error('[dsh-composer-predict] prediction failed:', stats.lastFailure)
       })
-      .finally(() => { inflight -= 1 })
+      .finally(() => {
+        clearTimeout(timer)
+        if (running !== slot) return
+        running = null
+        inflight = 0
+      })
   }, { global: true })
 }

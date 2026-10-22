@@ -13,16 +13,49 @@ const routes = []
 let listener
 let listenerOptions
 
+/**
+ * Stub for the token-meter `contextPressure` projection. `ratio` is the share
+ * of the window in use; leaving it undefined makes the registry answer with no
+ * pressure at all, which is the "no opinion" case the plugin must not act on.
+ */
+const pressure = { ratio: undefined }
+
 const ctx = {
   llm: {
     /** @param {object} options - the exact request the plugin builds. */
     async *stream(options) {
       ctx.calls = (ctx.calls ?? 0) + 1
       ctx.lastOptions = options
+      if (ctx.gate === true) {
+        // Hold the stream open until the plugin aborts it, so a newer turn can
+        // supersede this one.
+        await new Promise((resolve, reject) => {
+          if (options.signal?.aborted === true) {
+            reject(new Error('aborted'))
+            return
+          }
+          options.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+        })
+      }
       yield { type: 'text-delta', index: 0, text: '"把测试跑一遍，' }
       yield { type: 'text-delta', index: 0, text: '然后告诉我结果。"' }
       yield { type: 'finish', reason: { kind: 'stop' } }
     },
+  },
+  /** Soft service read, mirroring `ctx.get('sessionProjections')` on a real host. */
+  get(name) {
+    if (name !== 'sessionProjections') return undefined
+    return {
+      snapshot() {
+        if (pressure.ratio === undefined) return { asOfSeq: 0, values: {} }
+        return {
+          asOfSeq: 0,
+          values: {
+            contextPressure: { pressureTokens: Math.round(pressure.ratio * 1000), contextWindow: 1000 },
+          },
+        }
+      },
+    }
   },
   webServer: {
     /** @param {object} route - registered route. */
@@ -120,6 +153,39 @@ await new Promise(resolve => setTimeout(resolve, 50))
 assert.equal(ctx.calls, beforeAbort, 'aborted turn spends nothing')
 assert.deepEqual(Object.keys(readState('session-1')).sort(), ['1', '2'], 'aborted turn adds no entry')
 
+// --- occupancy guard: a nearly full window stands down -------------------
+const beforePressure = ctx.calls
+pressure.ratio = 0.95
+session.seq = 45
+listener(session, { type: 'turn/end', data: { turn: 4, reason: { kind: 'completed' } } })
+await new Promise(resolve => setTimeout(resolve, 50))
+assert.equal(ctx.calls, beforePressure, 'a nearly full context spends nothing')
+assert.equal(readState('session-1')['4'], undefined, 'a skipped turn stores no entry')
+
+// --- the guard is inert when the route reports no capacity ---------------
+pressure.ratio = undefined
+session.seq = 46
+listener(session, { type: 'turn/end', data: { turn: 5, reason: { kind: 'completed' } } })
+await new Promise(resolve => setTimeout(resolve, 100))
+assert.equal(ctx.calls, beforePressure + 1, 'missing occupancy never blocks a guess')
+assert.ok(readState('session-1')['5'], 'the unguarded turn still predicts')
+
+// --- newest wins: a newer turn supersedes the running guess --------------
+ctx.gate = true
+session.seq = 47
+listener(session, { type: 'turn/end', data: { turn: 6, reason: { kind: 'completed' } } })
+await new Promise(resolve => setTimeout(resolve, 30))
+assert.equal(ctx.calls, beforePressure + 2, 'the older guess did start')
+assert.equal(readState('session-1')['6'], undefined, 'and has not finished yet')
+
+ctx.gate = false
+session.seq = 48
+listener(session, { type: 'turn/end', data: { turn: 7, reason: { kind: 'completed' } } })
+await new Promise(resolve => setTimeout(resolve, 150))
+const afterSupersede = readState('session-1')
+assert.equal(afterSupersede['6'], undefined, 'superseded turn stores nothing')
+assert.ok(afterSupersede['7'], 'the newest turn is the one that lands')
+
 // --- unknown session answers an empty map --------------------------------
 assert.deepEqual(readState('nope'), {}, 'unknown session answers {}')
 
@@ -138,11 +204,15 @@ diagRoute.handler({ method: 'GET', url: '/plugins/dsh-composer-predict/diag' }, 
   end(chunk) { diag = chunk },
 })
 const diagPayload = JSON.parse(diag)
-assert.equal(diagPayload.turnEnds, 4, 'every turn/end was seen')
-assert.equal(diagPayload.starts, 2, 'two predictions actually ran')
+assert.equal(diagPayload.turnEnds, 8, 'every turn/end was seen')
+assert.equal(diagPayload.starts, 5, 'five predictions actually ran')
 assert.ok(diagPayload.skipped >= 2, 'duplicate + aborted were skipped')
-assert.equal(diagPayload.cached, 2, 'two cached turns')
+assert.equal(diagPayload.pressureSkips, 1, 'the occupancy guard stood down once')
+assert.equal(diagPayload.superseded, 1, 'supersession is counted apart from failure')
+assert.equal(diagPayload.failures, 0, 'an aborted guess is not a failure')
+assert.equal(diagPayload.lastPressure, 0.95, 'the measured occupancy is reported')
+assert.equal(diagPayload.cached, 4, 'four cached turns')
 assert.equal(diagPayload.sessions, 1, 'one cached session')
 assert.ok(!JSON.stringify(diagPayload).includes('把测试'), 'diag never carries prediction text')
 
-console.log('smoke OK — prefix replay, per-turn cache, coexistence, skip, diag, and routes all verified')
+console.log('smoke OK — prefix replay, per-turn cache, coexistence, skip, occupancy guard, supersession, diag, and routes all verified')

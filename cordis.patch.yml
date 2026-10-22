@@ -1,9 +1,13 @@
 # Host + client halves of the composer-prediction plugin.
 #
 # Host half: serves GET /plugins/dsh-composer-predict/state?session=<id> (the
-# suggestion the browser polls) and listens for turn/end to generate it.
-# Client half: the `conversation.input.dock` entry above the composer card,
+# suggestions the browser polls) and listens for turn/end to generate them. It
+# keeps one auxiliary call in flight (the newest finished turn wins), and skips
+# a turn once the next request would occupy `maxPressureRatio` of the window.
+# Client half: the `conversation.chat.turnTail` entry under each completed turn,
 # declared through `dsh.client` in package.json.
+#
+# Optional config: maxTokens, timeoutMs, maxPressureRatio.
 #
 # Rollback: remove the `composer-predict` insert below (or drop the package from
 # the profile's `dsh.profile.bundles`), then restart the host.
