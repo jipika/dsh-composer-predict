@@ -1,0 +1,42 @@
+# Publish to npm from CI.
+#
+# The point is the network path, not the automation: publishing from some
+# networks fails because every request carrying an `Authorization` header is
+# dropped on the way to registry.npmjs.org, so `npm publish` never completes
+# even though anonymous metadata reads work fine. A GitHub runner has a normal
+# egress, so the same command succeeds there.
+#
+# Requires a repository secret `NPM_TOKEN`: an npm **automation** token (or a
+# granular token scoped to this package with publish + "bypass 2FA" enabled).
+# Do not reuse a full-account classic token — this repository is public.
+name: publish
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Guard — the token must be present
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "::error::NPM_TOKEN secret is missing"
+            exit 1
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Smoke test
+        run: node tests/smoke.mjs
+      - name: Publish
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
