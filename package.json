@@ -1,0 +1,55 @@
+{
+  "name": "dsh-composer-predict",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Next-message predictions for DeepSeek Harness: one quiet suggestion at the end of every turn, accepted with Tab.",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "composer",
+    "prediction",
+    "suggestion"
+  ],
+  "author": "jipika",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jipika/dsh-composer-predict.git"
+  },
+  "homepage": "https://github.com/jipika/dsh-composer-predict#readme",
+  "bugs": {
+    "url": "https://github.com/jipika/dsh-composer-predict/issues"
+  },
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node tests/smoke.mjs"
+  },
+  "engines": {
+    "dsh": ">=0.2.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}
